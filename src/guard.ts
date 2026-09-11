@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { minimatch } from "minimatch";
 import type { CodexProConfig } from "./config.js";
-import { expandHome } from "./config.js";
+import { expandHome, GENERATED_FILE_GLOBS } from "./config.js";
 
 export interface Workspace {
   id: string;
@@ -137,17 +137,20 @@ export class WorkspaceManager {
 export class PathGuard {
   constructor(private readonly config: CodexProConfig) {}
 
-  isBlockedRelativePath(relPath: string): boolean {
+  isBlockedRelativePath(relPath: string, explicitAccess = false): boolean {
     const rel = normalizeRelPath(relPath).replace(/^\.\//, "");
     if (!rel || rel === ".") return false;
-    return this.config.blockedGlobs.some((glob) =>
+    const globs = !explicitAccess && this.config.allowGeneratedFiles
+      ? [...this.config.blockedGlobs, ...GENERATED_FILE_GLOBS]
+      : this.config.blockedGlobs;
+    return globs.some((glob) =>
       minimatch(rel, glob, { dot: true, nocase: false, matchBase: false }) ||
       minimatch(path.basename(rel), glob, { dot: true, nocase: false, matchBase: true })
     );
   }
 
   assertNotBlocked(relPath: string): void {
-    if (this.isBlockedRelativePath(relPath)) {
+    if (this.isBlockedRelativePath(relPath, true)) {
       throw new CodexProError(`Path is blocked by safety rules: ${relPath}`);
     }
   }

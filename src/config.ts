@@ -36,6 +36,7 @@ export interface CodexProConfig {
   maxHttpSessions: number;
   httpSessionTtlMs: number;
   blockedGlobs: string[];
+  allowGeneratedFiles: boolean;
   contextDir: string;
   toolCards: boolean;
   connectionTest: boolean;
@@ -47,9 +48,6 @@ const DEFAULT_BLOCKED_GLOBS = [
   ".git",
   ".git/**",
   "**/.git/**",
-  "node_modules",
-  "node_modules/**",
-  "**/node_modules/**",
   ".env",
   ".env/**",
   ".env.*",
@@ -64,7 +62,13 @@ const DEFAULT_BLOCKED_GLOBS = [
   "**/id_rsa.*",
   "**/id_ed25519",
   "**/id_ed25519.*",
-  "**/.ssh/**",
+  "**/.ssh/**"
+];
+
+export const GENERATED_FILE_GLOBS = [
+  "node_modules",
+  "node_modules/**",
+  "**/node_modules/**",
   "dist",
   "dist/**",
   "**/dist/**",
@@ -285,6 +289,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
         ? args["tool-cards"]
         : undefined;
   const extraBlockedGlobs = splitList(process.env.CODEXPRO_BLOCKED_GLOBS, ",");
+  const allowGeneratedFiles = boolFrom(process.env.CODEXPRO_ALLOW_GENERATED_FILES, false);
   const host = hostArg ?? process.env.CODEXPRO_HOST ?? process.env.HOST ?? "127.0.0.1";
   const authToken = process.env.CODEXPRO_HTTP_TOKEN ?? process.env.CODEBASE_BRIDGE_HTTP_TOKEN;
   if (authToken && Buffer.byteLength(authToken, "utf8") < MIN_HTTP_TOKEN_BYTES) {
@@ -331,7 +336,8 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     maxSearchResults: numberFrom(process.env.CODEXPRO_MAX_SEARCH_RESULTS, 200, 5, 2_000),
     maxHttpSessions: numberFrom(process.env.CODEXPRO_MAX_HTTP_SESSIONS, 64, 1, 512),
     httpSessionTtlMs: process.env.CODEXPRO_HTTP_SESSION_TTL_MS === "0" ? 0 : numberFrom(process.env.CODEXPRO_HTTP_SESSION_TTL_MS, 30 * 60_000, 60_000, 2_147_483_647),
-    blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs],
+    blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...(allowGeneratedFiles ? [] : GENERATED_FILE_GLOBS), ...extraBlockedGlobs],
+    allowGeneratedFiles,
     contextDir: contextDirFrom(process.env.CODEXPRO_CONTEXT_DIR),
     toolCards: boolFrom(toolCardsArg ?? process.env.CODEXPRO_TOOL_CARDS, false),
     connectionTest: boolFrom(process.env.CODEXPRO_CONNECTION_TEST, false),

@@ -502,6 +502,7 @@ function serverInstructions(config: CodexProConfig): string {
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; that selection stays active for this MCP session.",
     "2. Read workspace instructions, but current user authorization and standing instructions take precedence over default workflow advice. Do not invoke other models or delegate when the user prohibits it.",
     "3. Prefer tree/search/read for inspection and show_changes for diffs; full bash may perform other user-authorized commands. Use the returned root when resolving paths.",
+    config.allowGeneratedFiles ? "Generated build and dependency files may be read or edited by explicit path. Routine tree/search discovery still omits them; use targeted bash listing if needed." : "",
     editInstruction,
     bashInstruction,
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
@@ -1078,6 +1079,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         tool_contract_revision: "gcp-autonomous-jobs-v1",
         maxSearchResults: config.maxSearchResults,
         blockedGlobs: config.blockedGlobs,
+        allowGeneratedFiles: config.allowGeneratedFiles,
+        discoveryIgnoresGeneratedFiles: true,
+        file_access_revision: "explicit-generated-files-v1",
         registeredTools: registeredToolNames(server),
         registeredToolCount: registeredToolNames(server).length
       };
