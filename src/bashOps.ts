@@ -16,6 +16,8 @@ export interface BashResult {
   stdout: string;
   stderr: string;
   truncated: boolean;
+  timedOut: boolean;
+  cancelled: boolean;
   bashSessionId?: string;
 }
 
@@ -269,14 +271,16 @@ export async function runBash(
   guard: PathGuard,
   workspace: Workspace,
   command: string,
-  options: { cwd?: string; timeoutMs?: number; sessionId?: string } = {}
+  options: { cwd?: string; timeoutMs?: number; sessionId?: string; signal?: AbortSignal } = {}
 ): Promise<BashResult> {
   if (!command?.trim()) throw new CodexProError("command is required.");
   const bashSessionId = assertBashSession(config, options.sessionId);
   assertSafeCommand(config, command);
   const cwdResolved = guard.resolve(workspace, options.cwd ?? ".");
   const cwd = cwdResolved.absPath;
-  const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 30_000, config.maxBashTimeoutMs));
+  const requestedTimeout = options.timeoutMs ?? (config.maxBashTimeoutMs === 0 ? 0 : 30_000);
+  const timeoutMs = config.maxBashTimeoutMs === 0 ? Math.max(0, requestedTimeout)
+    : Math.max(1_000, Math.min(requestedTimeout || config.maxBashTimeoutMs, config.maxBashTimeoutMs));
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
@@ -316,24 +320,28 @@ export async function runBash(
       return current + bytes.subarray(0, remaining).toString("utf8");
     };
 
-    const timer = setTimeout(() => {
+    const onAbort = () => terminateWithEscalation();
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+    const timer = timeoutMs > 0 ? setTimeout(() => {
       killedByTimeout = true;
       terminateWithEscalation();
-    }, timeoutMs);
-    timer.unref();
+    }, timeoutMs) : undefined;
+    timer?.unref();
 
     child.stdout.on("data", (chunk) => {
       stdout = appendBounded(stdout, chunk);
-      if (observedOutputBytes > config.maxOutputBytes) terminateWithEscalation();
+      if (config.maxBashTimeoutMs !== 0 && observedOutputBytes > config.maxOutputBytes) terminateWithEscalation();
     });
     child.stderr.on("data", (chunk) => {
       stderr = appendBounded(stderr, chunk);
-      if (observedOutputBytes > config.maxOutputBytes) terminateWithEscalation();
+      if (config.maxBashTimeoutMs !== 0 && observedOutputBytes > config.maxOutputBytes) terminateWithEscalation();
     });
     child.on("error", reject);
     child.on("close", (exitCode, signal) => {
       closed = true;
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
       if (killTimer) clearTimeout(killTimer);
       if (killedByTimeout) {
         stderr += `\n[codexpro] Command timed out after ${timeoutMs} ms.`;
@@ -341,14 +349,16 @@ export async function runBash(
       const out = trimOutput(redactSensitiveText(stdout), config.maxOutputBytes);
       const err = trimOutput(redactSensitiveText(stderr), config.maxOutputBytes);
       resolve({
-        command,
+        command: redactSensitiveText(command),
         cwd: path.relative(workspace.root, cwd) || ".",
         exitCode,
         signal,
         durationMs: Date.now() - start,
         stdout: out.value,
         stderr: err.value,
-        truncated: out.truncated || err.truncated,
+        truncated: observedOutputBytes > config.maxOutputBytes || out.truncated || err.truncated,
+        timedOut: killedByTimeout,
+        cancelled: options.signal?.aborted ?? false,
         ...(bashSessionId ? { bashSessionId } : {})
       });
     });

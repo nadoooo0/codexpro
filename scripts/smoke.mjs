@@ -1145,7 +1145,8 @@ if (process.platform !== 'win32') {
     arguments: {
       workspace_id: processTreeOpened.structuredContent.workspace_id,
       command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(descendantScript)}`,
-      timeout_ms: 1000
+      // Allow the instrumented Node child to start on a busy VM before testing tree termination.
+      timeout_ms: 5000
     }
   });
   if (!timedOutTree.structuredContent.stderr?.includes('Command timed out')) {

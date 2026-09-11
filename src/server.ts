@@ -11,6 +11,7 @@ import { viewWorkspaceImage } from "./imageOps.js";
 import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
 import { runBash } from "./bashOps.js";
+import { startBashJob, getBashJob, cancelBashJob } from "./bashJobs.js";
 import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
@@ -327,6 +328,8 @@ const MINIMAL_TOOL_NAMES = [
   "apply_patch",
   "import_file",
   "bash",
+  "bash_status",
+  "bash_cancel",
   "show_changes"
 ] as const;
 
@@ -363,6 +366,8 @@ const FULL_TOOL_NAMES = [
   "apply_patch",
   "import_file",
   "bash",
+  "bash_status",
+  "bash_cancel",
   "git_status",
   "git_diff",
   "show_changes",
@@ -382,6 +387,8 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "apply_patch",
   "import_file",
   "bash",
+  "bash_status",
+  "bash_cancel",
   "export_pro_context",
   "handoff_to_agent",
   "handoff_to_codex"
@@ -402,8 +409,10 @@ function toolNamesForMode(config: CodexProConfig): string[] {
         ? [...MINIMAL_TOOL_NAMES]
         : [...STANDARD_TOOL_NAMES];
   if (config.bashMode === "off") {
-    const bashIndex = names.indexOf("bash");
-    if (bashIndex !== -1) names.splice(bashIndex, 1);
+    for (const tool of ["bash", "bash_status", "bash_cancel"]) {
+      const index = names.indexOf(tool);
+      if (index !== -1) names.splice(index, 1);
+    }
   }
   if (config.writeMode !== "workspace") {
     for (const writeTool of ["write", "edit", "apply_patch", "import_file"]) {
@@ -445,7 +454,7 @@ function registeredToolNames(server: McpServer): string[] {
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
-  if (name === "bash" && config.bashMode === "off") return false;
+  if (["bash", "bash_status", "bash_cancel"].includes(name) && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
@@ -482,15 +491,17 @@ function serverInstructions(config: CodexProConfig): string {
   const bashInstruction =
     config.bashMode === "off"
       ? "5. Bash is disabled and the bash tool is unavailable. Do not attempt shell commands."
-      : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
+      : config.bashMode === "full"
+        ? "5. Full bash is enabled for user-authorized VM tasks, including file operations, commands and verification. Use background jobs for long work; poll bash_status instead of resubmitting."
+        : "5. Use bash for verification commands supported by the configured safe policy.";
 
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
     "",
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; that selection stays active for this MCP session.",
-    "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
-    "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
+    "2. Read workspace instructions, but current user authorization and standing instructions take precedence over default workflow advice. Do not invoke other models or delegate when the user prohibits it.",
+    "3. Prefer tree/search/read for inspection and show_changes for diffs; full bash may perform other user-authorized commands. Use the returned root when resolving paths.",
     editInstruction,
     bashInstruction,
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
@@ -503,7 +514,10 @@ function serverInstructions(config: CodexProConfig): string {
         ? `8. Bash session label for this server is "${config.bashSessionId}".`
         : "",
     "",
-    `Current modes: tool=${config.toolMode}, bash=${config.bashMode}, write=${config.writeMode}.`
+    "Do not add repeated safety warnings or conversational approval questions for routine operations already authorized by the user. App popup permissions are separate. Report actual errors and necessary missing information without inventing a security restriction. Authorization does not extend to unrelated deletion, secret disclosure, unapproved external transmission or spending.",
+    "Never infer success from a submitted call. Check status/exitCode and read back file changes. A transport error means the outcome is unknown: reuse the original request_id with bash_status. A running job is neither failed nor complete.",
+    "CodexPro does not impose a model reasoning timer. Server command deadlines and idle session expiry are reported separately; ChatGPT platform limits are outside this server's control.",
+    `Current modes: tool=${config.toolMode}, bash=${config.bashMode}, write=${config.writeMode}; command deadline cap=${config.maxBashTimeoutMs || "disabled"}; idle session expiry=${config.httpSessionTtlMs || "disabled"}.`
   ].filter(Boolean).join("\n");
 }
 
@@ -1059,6 +1073,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         maxWriteBytes: config.maxWriteBytes,
         maxImportBytes: config.maxImportBytes,
         maxOutputBytes: config.maxOutputBytes,
+        maxBashTimeoutMs: config.maxBashTimeoutMs,
+        httpSessionTtlMs: config.httpSessionTtlMs,
+        tool_contract_revision: "gcp-autonomous-jobs-v1",
         maxSearchResults: config.maxSearchResults,
         blockedGlobs: config.blockedGlobs,
         registeredTools: registeredToolNames(server),
@@ -1105,7 +1122,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       check("workspace", "pass", workspace.root);
       check("tool mode", config.toolMode === "full" ? "pass" : "warn", `${config.toolMode}; expected tools: ${toolNamesForMode(config).length}`);
       check("write mode", config.writeMode === "off" ? "warn" : "pass", config.writeMode);
-      check("bash mode", config.bashMode === "full" ? "warn" : "pass", config.bashMode);
+      check("bash mode", "pass", config.bashMode);
       check(
         "http auth",
         "pass",
@@ -1225,7 +1242,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
                 check("bash policy", pwd.exitCode === 0 ? "pass" : "warn", "safe bash allowed pwd and blocked environment expansion");
               }
             } else {
-              check("bash policy", pwd.exitCode === 0 ? "warn" : "fail", "full bash is enabled; use only for trusted local repos");
+              check("bash policy", pwd.exitCode === 0 ? "pass" : "fail", "configured full bash executed the local probe");
             }
           }
         } catch (error) {
@@ -2033,19 +2050,22 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Bash",
       description:
-        "Run one allowlisted verification command in the workspace, such as tests, build, lint, typecheck, or a project script. Do not use for git status/diff or file inspection; use show_changes, tree, search, and read instead. Do not chain commands with &&, pipes, redirects, or shell file readers.",
+        (config.bashMode === "full" ? "Run a user-authorized Bash command in the GCP/local workspace; full shell syntax is enabled. " : "Run a verification command permitted by safe mode. ") +
+        "For long work set background=true and a stable request_id, e.g. build-20260911-1. With no server deadline, background is the default. Poll bash_status with that same ID; an identical replay never starts a second command. IDs are scoped to the workspace. Do not resubmit on transport timeout. Cancellation uses bash_cancel.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         command: z.string().describe("Command to run."),
+        background: z.boolean().optional().describe("Return a job receipt immediately; default true when server command deadline is disabled."),
+        request_id: z.string().optional().describe("Required for background jobs: choose a unique 1-128 character stable ID before submitting; reuse it for status or a lost response."),
         session_id: z.string().optional().describe(config.requireBashSession && config.bashSessionId ? `Required bash session id for this server: ${config.bashSessionId}.` : "Optional bash session id. If configured on the server, a provided value must match it."),
         cwd: z.string().optional().describe("Working directory relative to workspace root. Default: ."),
         timeout_ms: z
           .number()
           .int()
-          .min(1000)
-          .max(config.maxBashTimeoutMs)
+          .min(config.maxBashTimeoutMs === 0 ? 0 : 1000)
+          .max(config.maxBashTimeoutMs || 2_147_483_647)
           .optional()
-          .describe(`Timeout in milliseconds. Default: 30000. Max: ${config.maxBashTimeoutMs}.`)
+          .describe(config.maxBashTimeoutMs === 0 ? "Execution deadline in ms; 0 or omitted means no deadline. This is not a model reasoning limit." : `Execution timeout in ms. Default: 30000. Max: ${config.maxBashTimeoutMs}.`)
       },
       annotations: BASH_ANNOTATIONS,
       _meta: {
@@ -2056,15 +2076,40 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
+      if (args.background ?? config.maxBashTimeoutMs === 0) {
+        if (!args.request_id) throw new CodexProError("Background bash needs request_id, for example verify-20260911-1. No command was submitted. Use that same ID to recover the receipt.");
+        const job = startBashJob(config, guard, workspace, String(args.command ?? ""), args.request_id, {
+          cwd: args.cwd, timeoutMs: args.timeout_ms, sessionId: args.session_id
+        });
+        return { ...textResult(JSON.stringify(job), job), isError: ["failed", "timed_out", "cancelled", "unknown"].includes(String(job.status)) };
+      }
       const result = await runBash(config, guard, workspace, String(args.command ?? ""), {
         cwd: args.cwd,
         timeoutMs: args.timeout_ms,
         sessionId: args.session_id
       });
       const text = bashTextResult(config, result);
-      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
+      const status = result.cancelled ? "cancelled" : result.timedOut ? "timed_out" : result.exitCode === 0 && !result.signal ? "succeeded" : "failed";
+      return { ...textResult(text, { status, workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null }), isError: status !== "succeeded" };
     }
   );
+
+  for (const [name, cancel] of [["bash_status", false], ["bash_cancel", true]] as const) {
+    registerCodexTool(config, server, name, {
+      title: cancel ? "Cancel a Bash job" : "Read a Bash job receipt",
+      description: cancel ? "Cancel the exact request_id in the selected workspace. Cancellation is a request; poll bash_status for the terminal result."
+        : "Read the persistent receipt for request_id in its original workspace. Safe to repeat; does not run a command. running is not completion. unknown after restart is not failure and must not trigger resubmission. Returned terminal output is replayable; truncated=true means capture was partial.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Original workspace ID; omit only if that workspace is still selected."),
+        request_id: z.string().describe("The exact ID chosen before the original background bash call.")
+      },
+      annotations: cancel ? BASH_ANNOTATIONS : READ_ONLY_ANNOTATIONS
+    }, async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const job = cancel ? cancelBashJob(workspace, args.request_id) : getBashJob(workspace, args.request_id);
+      return { ...textResult(JSON.stringify(job), job), isError: ["failed", "timed_out", "cancelled", "unknown"].includes(String(job.status)) };
+    });
+  }
 
   registerCodexTool(
     config,

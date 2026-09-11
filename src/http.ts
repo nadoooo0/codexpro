@@ -1590,7 +1590,7 @@ async function main(): Promise<void> {
   function pruneTransports(): void {
     const now = Date.now();
     for (const [sessionId, record] of transports) {
-      if (now - record.lastSeenAt > config.httpSessionTtlMs) {
+      if (config.httpSessionTtlMs > 0 && now - record.lastSeenAt > config.httpSessionTtlMs) {
         transports.delete(sessionId);
         closeTransport(record);
       }
@@ -1612,7 +1612,7 @@ async function main(): Promise<void> {
     return record.transport;
   }
 
-  const pruneTimer = setInterval(pruneTransports, Math.min(config.httpSessionTtlMs, 60_000));
+  const pruneTimer = setInterval(pruneTransports, config.httpSessionTtlMs > 0 ? Math.min(config.httpSessionTtlMs, 60_000) : 60_000);
   pruneTimer.unref();
 
   app.get("/", (_req, res) => {
